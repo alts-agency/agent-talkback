@@ -1,0 +1,14 @@
+talkback.log*
+__pycache__/
+*.pyc
+.pytest_cache/
+settings.json
+settings.bad.json
+secrets/*
+!secrets/README.md
+*.egg-info/
+.venv/
+build/
+dist/
+shot-*.png
+shot.log

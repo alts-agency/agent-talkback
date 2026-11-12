@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Agent Talkback">
+  <title>Agent Talkback</title>
+  <rect width="256" height="256" rx="56" fill="#000000"/>
+  <g transform="translate(128 128) scale(1.535990) translate(-40.6310 -49.9999)">
+    <path d="M81 60V162L380 305Q400 314 418 320Q436 326 445 328Q435 330 416.5 336.5Q398 343 380 352L81 495V599L519 386V273Z" transform="translate(-15.028 111.132) scale(0.18553 -0.18553)" fill="#FFFFFF"/>
+  </g>
+</svg>
