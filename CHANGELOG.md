@@ -1,7 +1,7 @@
 # Changelog
 What a user of Talkback would notice. Format follows Keep a Changelog; versions follow semver.
 
-## [Unreleased]
+## [0.3.0] - 2026-11-13
 
 ### Added
 - **Desktop shortcut** is a third switch in the console: it puts **Agent Talkback** on the desktop, and
