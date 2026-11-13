@@ -159,7 +159,8 @@ The icon is the Alts Agency chevron: white when Talkback speaks, grey when it is
   limit in one dialog. **Set as primary** makes a provider speak first. **+ Add provider** adds any OpenAI-compatible
   speech endpoint.
 - **Talkback Voice** switches speaking on and off, the same as the tray icon. **Start with Windows** starts Talkback
-  when you log in.
+  when you log in. **Desktop shortcut** puts a shortcut to this window on your desktop, and switching it off
+  deletes the shortcut again.
 - **alts.agency** at the top right opens our website.
 
 The window has a fixed size. Accent colours were checked for contrast in light and dark mode.

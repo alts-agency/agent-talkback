@@ -3,6 +3,10 @@ What a user of Talkback would notice. Format follows Keep a Changelog; versions 
 
 ## [Unreleased]
 
+### Added
+- **Desktop shortcut** is a third switch in the console: it puts **Agent Talkback** on the desktop, and
+  switching it off deletes the shortcut again.
+
 ## [0.2.0] - 2026-11-12
 The first public release.
 

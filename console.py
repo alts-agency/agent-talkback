@@ -107,20 +107,51 @@ def _encoded(script):
     return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
 
 
-def set_startup(enabled):
-    """Create or remove the login shortcut (pythonw talkback.py, with the app's icon); True when it worked."""
+def desktop_link():
+    """The shortcut the console can put on the desktop. Windows knows where the desktop is, OneDrive or not."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Explorer"
+                                                      r"\User Shell Folders") as key:
+            folder = os.path.expandvars(str(winreg.QueryValueEx(key, "Desktop")[0]))
+    except (ImportError, OSError):
+        folder = ""
+    return (Path(folder) if folder else Path(os.environ.get("USERPROFILE", "")) / "Desktop") / "Agent Talkback.lnk"
+
+
+def desktop_enabled():
+    return desktop_link().is_file()
+
+
+def _shortcut_script(link, entry):
+    """The PowerShell that writes one shortcut: this Python's pythonw, one script here, with the app's icon."""
+    return ("$s = (New-Object -ComObject WScript.Shell).CreateShortcut(" + _quoted(link) + ");"
+            "$s.TargetPath = " + _quoted(Path(sys.executable).with_name("pythonw.exe")) + ";"
+            "$s.Arguments = " + _quoted('"' + str(HERE / entry) + '"') + ";"
+            "$s.WorkingDirectory = " + _quoted(HERE) + ";"
+            "$s.IconLocation = " + _quoted(HERE / "assets" / "talkback.ico") + ";"
+            "$s.Save()")
+
+
+def _write_shortcut(link, entry, enabled):
+    """Write or delete one shortcut; False when the file on disk still disagrees with what was asked."""
     if enabled:
-        script = ("$s = (New-Object -ComObject WScript.Shell).CreateShortcut(" + _quoted(startup_link()) + ");"
-                  "$s.TargetPath = " + _quoted(Path(sys.executable).with_name("pythonw.exe")) + ";"
-                  "$s.Arguments = " + _quoted('"' + str(HERE / "talkback.py") + '"') + ";"
-                  "$s.WorkingDirectory = " + _quoted(HERE) + ";"
-                  "$s.IconLocation = " + _quoted(HERE / "assets" / "talkback.ico") + ";"
-                  "$s.Save()")
+        script = _shortcut_script(link, entry)
     else:
-        script = "Remove-Item -LiteralPath " + _quoted(startup_link()) + " -ErrorAction SilentlyContinue"
+        script = "Remove-Item -LiteralPath " + _quoted(link) + " -ErrorAction SilentlyContinue"
     subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", _encoded(script)],
                    capture_output=True, creationflags=0x08000000)
-    return startup_enabled() == enabled
+    return Path(link).is_file() == enabled
+
+
+def set_startup(enabled):
+    """Create or remove the login shortcut (pythonw talkback.py, with the app's icon); True when it worked."""
+    return _write_shortcut(startup_link(), "talkback.py", enabled)
+
+
+def set_desktop(enabled):
+    """Create or remove the desktop shortcut (pythonw console.py, so this window is one double-click away)."""
+    return _write_shortcut(desktop_link(), "console.py", enabled)
 
 
 def reload_running(port):
@@ -457,6 +488,12 @@ class Console(tk.Tk):
         self.switch = self._switch_row(switches, "Start with Windows",
                                        "Agent Talkback waits in the tray from the moment you log in.",
                                        self.startup_on.get(), self.toggle_startup)
+        divider(switches, self.c)
+        self.desktop_on = tk.BooleanVar(value=desktop_enabled())
+        self.desktop_switch = self._switch_row(switches, "Desktop shortcut",
+                                               "Puts Agent Talkback on your desktop, and takes it away when you switch "
+                                               "this off.",
+                                               self.desktop_on.get(), self.toggle_desktop)
 
         self.bottom = tk.Frame(self, bg=self.c["bg"], padx=24, pady=12)
         self.bottom.grid(row=1, column=0, sticky="ew")
@@ -568,6 +605,8 @@ class Console(tk.Tk):
 
         self.startup_on.set(startup_enabled())
         self.switch.set(self.startup_on.get())
+        self.desktop_on.set(desktop_enabled())
+        self.desktop_switch.set(self.desktop_on.get())
         missing = missing_packages()
         problems = [line for line in self.settings.problems if line]
         if problems or missing:            # the only lines worth a word: something is wrong, or something is missing
@@ -672,6 +711,13 @@ class Console(tk.Tk):
         threading.Thread(target=lambda: self.results.put(("startup", wanted, set_startup(wanted))),
                          daemon=True).start()
 
+    def toggle_desktop(self, wanted):
+        """The same for the desktop link: move at once, write or delete it on a thread, snap back if it failed."""
+        self.desktop_on.set(wanted)
+        self.desktop_switch.set(wanted)
+        threading.Thread(target=lambda: self.results.put(("desktop", wanted, set_desktop(wanted))),
+                         daemon=True).start()
+
     def drain(self):
         """What the switch threads finished, applied where Tk is safe: the one place they report back."""
         while True:
@@ -687,6 +733,11 @@ class Console(tk.Tk):
                 messagebox.showerror("The shortcut was not changed",
                                      "Agent Talkback could not write its login shortcut in the Startup folder.",
                                      parent=self)
+            elif kind == "desktop" and not (ok and desktop_enabled() == wanted):
+                self.desktop_on.set(not wanted)
+                self.desktop_switch.set(not wanted)
+                messagebox.showerror("The shortcut was not changed",
+                                     "Agent Talkback could not write its shortcut on the desktop.", parent=self)
         self.after(120, self.drain)
 
     def install_packages(self):

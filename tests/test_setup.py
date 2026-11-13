@@ -315,6 +315,20 @@ class LoginShortcut(unittest.TestCase):
             link.write_text("", encoding="utf-8")
             self.assertTrue(console.startup_enabled())
 
+    def test_the_desktop_shortcut_is_named_after_the_app(self):
+        link = console.desktop_link()
+        self.assertEqual(link.name, "Agent Talkback.lnk")
+        self.assertTrue(link.parent.is_dir(), f"{link.parent} is not a folder")
+
+    def test_switching_the_desktop_shortcut_off_deletes_it(self):
+        with tempfile.TemporaryDirectory() as folder:
+            link = Path(folder) / "Agent Talkback.lnk"
+            link.write_text("", encoding="utf-8")
+            with mock.patch.object(console, "desktop_link", return_value=link):
+                self.assertTrue(console.desktop_enabled())
+                self.assertTrue(console.set_desktop(False))
+                self.assertFalse(link.exists())
+
     def test_a_powershell_string_escapes_only_quotes(self):
         self.assertEqual(console._quoted(r"C:\it's here"), r"'C:\it''s here'")
 
