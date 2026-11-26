@@ -600,7 +600,7 @@ class Console(tk.Tk):
         left.pack(side="left", fill="x", expand=True)
         tk.Label(left, text="Agent Talkback", bg=self.c["bg"], fg=self.c["text"],
                  font=font(22, "bold")).pack(anchor="w")
-        tk.Label(left, text="Released as open source by Alts Agency. Agent Talkback reads your agents' replies out loud. "
+        tk.Label(left, text="Released as open source by Alts Agency. This Agent Talkback tool allows your agents to speak back to you as they reply. "
                             "You can find updates and instructions on our website.", bg=self.c["bg"], fg=self.c["muted"], font=font(10),
                  justify="left", wraplength=720).pack(anchor="w", pady=(4, 0))
 
@@ -1115,7 +1115,7 @@ class ProviderDialog(Dialog):
         if not voice:
             return self.message("Enter a voice id.", bad=True)
         if limit and not (limit.isdigit() and int(limit) >= 40):
-            return self.message("Max characters must be blank or a whole number from 40 up.", bad=True)
+            return self.message("Max characters is a whole number, 40 or more, or blank.", bad=True)
         voice_set = {"name": "Default", "model": model, "voice": voice, "voices": [voice]}
         if limit:
             voice_set["request_limit"] = int(limit)
@@ -1150,7 +1150,7 @@ class ModelDialog(Dialog):
     def save(self):
         limit = self.text("limit")
         if limit and not (limit.isdigit() and int(limit) >= 40):
-            return self.message("Max characters must be blank or a whole number from 40 up.", bad=True)
+            return self.message("Max characters is a whole number, 40 or more, or blank.", bad=True)
         if self.name:
             clean, problem = edited_model(self.owner.work, self.name, self.text("model"), self.text("voice"), limit)
         else:
