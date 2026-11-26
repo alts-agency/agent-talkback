@@ -152,13 +152,13 @@ class Reload(FolderSettings):
         self.addCleanup(server.shutdown)
         port = server.server_address[1]
 
-        body = json.dumps({"text": "Testing talkback in Guy's Voice.", "source": "console",
+        body = json.dumps({"text": "Testing Talkback in Guy's voice.", "source": "console",
                            "only": "microsoft"}).encode("utf-8")
         request = urllib.request.Request(f"http://127.0.0.1:{port}/say", data=body, method="POST",
                                          headers={"Content-Type": "application/json"})
         self.assertEqual(urllib.request.urlopen(request, timeout=2).status, 202)
-        self.assertEqual(items.get(timeout=2), {"text": "Testing talkback in Guy's Voice.", "source": "console",
-                                                "only": "microsoft", "set": "", "voice": ""})
+        self.assertEqual(items.get(timeout=2), {"text": "Testing Talkback in Guy's voice.", "source": "console",
+                                                "only": "microsoft", "set": "", "voice": "", "talker": None})
 
     def test_a_test_line_can_name_the_voice_as_well_as_the_source(self):
         """A test speaks one voice without choosing it, so the store arrives as data and never as a pick."""
@@ -172,13 +172,14 @@ class Reload(FolderSettings):
         self.addCleanup(server.shutdown)
         port = server.server_address[1]
 
-        body = json.dumps({"text": "Testing talkback in nadine's Voice.", "source": "console", "only": "openrouter",
+        body = json.dumps({"text": "Testing Talkback in nadine's voice.", "source": "console", "only": "openrouter",
                            "set": "HeyGen", "voice": "nadine"}).encode("utf-8")
         request = urllib.request.Request(f"http://127.0.0.1:{port}/say", data=body, method="POST",
                                          headers={"Content-Type": "application/json"})
         self.assertEqual(urllib.request.urlopen(request, timeout=2).status, 202)
-        self.assertEqual(items.get(timeout=2), {"text": "Testing talkback in nadine's Voice.", "source": "console",
-                                                "only": "openrouter", "set": "HeyGen", "voice": "nadine"})
+        self.assertEqual(items.get(timeout=2), {"text": "Testing Talkback in nadine's voice.", "source": "console",
+                                                "only": "openrouter", "set": "HeyGen", "voice": "nadine",
+                                                "talker": None})
 
     def test_the_console_can_see_whether_speaking_is_off(self):
         self.settings()
@@ -296,11 +297,157 @@ class ConsoleWords(FolderSettings):
         self.assertRegex(console.new_id("x" * 80, set()), r"^[a-z0-9][a-z0-9-]{0,39}$")
 
     def test_the_test_line_names_the_voice(self):
-        self.assertEqual(console.test_words("en-US-JennyNeural"), "Testing talkback in Jenny's Voice.")
-        self.assertEqual(console.test_words("nadine"), "Testing talkback in nadine's Voice.")
+        self.assertEqual(console.test_words("en-US-JennyNeural"), "Testing Talkback in Jenny's voice.")
+        self.assertEqual(console.test_words("nadine"), "Testing Talkback in nadine's voice.")
 
     def test_both_palettes_have_every_colour(self):
         self.assertEqual(set(console.LIGHT), set(console.DARK))
+
+
+@unittest.skipUnless(HAVE_CONSOLE, "the console needs tkinter")
+class ModelsUnderOneProvider(FolderSettings):
+    """Add model: one provider, one endpoint and key, several voice models chosen under Change."""
+
+    FISH = "fish-audio/s2.1-pro-free:free"
+
+    def setUp(self):
+        super().setUp()
+        self.settings()
+        self.saved = talkback.Settings()
+        self.source = self.saved.source("openrouter")
+        talkback.active_set(self.source)["format"] = "pcm"
+        self.before = json.loads(json.dumps(self.source))
+
+    def test_a_model_is_added_as_a_set_and_nothing_else_moves(self):
+        clean, problem = console.with_model(self.source, self.FISH, "alloy", "300")
+        self.assertEqual(problem, "")
+        added = clean["sets"][-1]
+        self.assertEqual(added, {"name": "s2.1-pro-free", "model": self.FISH, "voice": "alloy", "voices": ["alloy"],
+                                 "request_limit": 300, "format": "pcm"})
+        self.assertEqual(clean["sets"][:-1], self.before["sets"])
+        self.assertEqual(clean["set"], self.before["set"])                  # the set in use stays
+        self.assertEqual(self.source, self.before)                          # a copy: the original is untouched
+        sources = self.saved["sources"]
+        sources[[entry["id"] for entry in sources].index("openrouter")] = clean
+        self.saved.save()
+        reloaded = talkback.Settings()
+        self.assertEqual(reloaded["primary"], self.saved["primary"])
+        self.assertEqual(len(reloaded.source("openrouter")["sets"]), len(self.before["sets"]) + 1)
+
+    def test_a_taken_set_name_gets_a_number(self):
+        self.assertEqual(console.set_name_for(self.FISH), "s2.1-pro-free")
+        self.assertEqual(console.set_name_for(self.FISH, {"s2.1-pro-free"}), "s2.1-pro-free 2")
+        self.assertEqual(console.set_name_for(self.FISH, {"s2.1-pro-free", "s2.1-pro-free 2"}), "s2.1-pro-free 3")
+
+    def test_without_a_format_none_is_copied(self):
+        talkback.active_set(self.source).pop("format")
+        clean, _ = console.with_model(self.source, self.FISH, "alloy")
+        self.assertNotIn("format", clean["sets"][-1])
+
+    def test_the_refusals(self):
+        self.assertEqual(console.with_model(self.source, " ", "alloy")[1], "Enter the model id.")
+        self.assertEqual(console.with_model(self.source, self.FISH, "")[1], "Enter a voice id.")
+        model = talkback.active_set(self.source)["model"]
+        self.assertEqual(console.with_model(self.source, model, "alloy")[1], f"OpenRouter already has {model}.")
+        full = self.source
+        while len(full["sets"]) < talkback.MAX_SETS:
+            full, _ = console.with_model(full, f"m/{len(full['sets'])}", "alloy")
+        clean, problem = console.with_model(full, self.FISH, "alloy")
+        self.assertIsNone(clean)
+        self.assertIn(str(talkback.MAX_SETS), problem)
+        self.assertIn("MAX_SETS in talkback.py", problem)
+
+    def test_the_model_column_counts_the_other_models(self):
+        model = talkback.active_set(self.source)["model"]
+        self.assertEqual(console.model_words(self.source), model)
+        clean, _ = console.with_model(self.source, self.FISH, "alloy")
+        self.assertEqual(console.model_words(clean), f"{model} +1")
+
+    def test_one_model_lists_its_voices_as_before(self):
+        voice_set = talkback.active_set(self.source)
+        rows = console.voice_rows(self.source)
+        self.assertEqual(len(console.model_tabs(self.source)), 1)           # one model: no tabs are drawn
+        voices = list(dict.fromkeys([*voice_set["voices"], voice_set["voice"]]))
+        self.assertEqual([row["voice"] for row in rows], voices)
+        self.assertEqual({row["set"] for row in rows}, {voice_set["name"]})
+
+    def test_one_tab_lists_only_its_model_and_each_keeps_a_shared_voice(self):
+        source = {"label": "P", "set": "a", "sets": [
+            {"name": "a", "model": "x/a", "voice": "alloy", "voices": ["alloy", "nova", "alloy"]},
+            {"name": "b", "model": "y/b:free", "voice": "alloy", "voices": ["alloy"]}]}
+        pairs = lambda name: [(row["set"], row["voice"]) for row in console.voice_rows(source, name)]  # noqa: E731
+        self.assertEqual(pairs("a"), [("a", "alloy"), ("a", "nova")])
+        self.assertEqual(pairs("b"), [("b", "alloy")])
+        self.assertEqual(pairs(None), pairs("a"))                           # no tab named: the model in use
+
+    def test_the_tabs_open_on_the_model_in_use(self):
+        source = {"label": "P", "set": "b", "sets": [
+            {"name": "a", "model": "x/a", "voice": "alloy", "voices": []},
+            {"name": "b", "model": "y/b:free", "voice": "nova", "voices": []}]}
+        tabs = console.model_tabs(source)
+        self.assertEqual([(tab["label"], tab["model"], tab["in_use"]) for tab in tabs],
+                         [("Model 1", "x/a", False), ("Model 2", "y/b:free", True)])
+        self.assertEqual(next(tab["set"] for tab in tabs if tab["in_use"]), talkback.active_set(source)["name"])
+
+    def two_models(self):
+        clean, _ = console.with_model(self.source, self.FISH, "alloy", "300")
+        return clean
+
+    def test_a_model_is_edited_in_the_working_copy(self):
+        work = self.two_models()
+        before = json.loads(json.dumps(work))
+        fish = work["sets"][1]["name"]
+        clean, problem = console.edited_model(work, fish, "fish-audio/s2-pro:free", "nova", "")
+        self.assertEqual(problem, "")
+        edited = clean["sets"][1]
+        self.assertEqual((edited["name"], edited["model"], edited["voice"], edited["voices"]),
+                         ("s2-pro", "fish-audio/s2-pro:free", "nova", ["nova", "alloy"]))   # renamed with its model
+        self.assertNotIn("request_limit", edited)                           # blank limit: none
+        self.assertEqual(edited["format"], "pcm")
+        self.assertEqual(clean["sets"][0], before["sets"][0])
+        self.assertEqual(clean["set"], before["set"])
+        self.assertEqual(work, before)                                      # a copy: the working copy is untouched
+        again, _ = console.edited_model(clean, "s2-pro", "fish-audio/s2-pro:free", "alloy", "200")
+        self.assertEqual(again["sets"][1]["name"], "s2-pro")                # the same model: the name stays
+        self.assertEqual(again["sets"][1]["voices"], ["nova", "alloy"])     # a known voice keeps its place
+        self.assertEqual(again["sets"][1]["request_limit"], 200)
+        in_use = before["set"]                                              # renaming the model in use moves `set`
+        moved, _ = console.edited_model(work, in_use, "x/other-model", "nova")
+        self.assertEqual((moved["set"], moved["sets"][0]["name"]), ("other-model", "other-model"))
+
+    def test_an_edit_refuses_a_model_another_set_has(self):
+        work = self.two_models()
+        first, fish = work["sets"][0], work["sets"][1]["name"]
+        self.assertEqual(console.edited_model(work, fish, first["model"], "alloy")[1],
+                         f"OpenRouter already has {first['model']}.")
+        self.assertEqual(console.edited_model(work, fish, self.FISH, "alloy")[1], "")   # its own model is fine
+        self.assertEqual(console.edited_model(work, fish, "", "alloy")[1], "Enter the model id.")
+
+    def test_remove_keeps_the_last_and_moves_the_model_in_use(self):
+        work = self.two_models()
+        first, fish = work["sets"][0]["name"], work["sets"][1]["name"]
+        kept = console.without_model(work, fish)
+        self.assertEqual([item["name"] for item in kept["sets"]], [first])
+        self.assertEqual(kept["set"], first)
+        work["set"] = fish
+        moved = console.without_model(work, fish)
+        self.assertEqual(moved["set"], first)                               # the one in use went: the first is in use
+        work["set"] = first
+        moved = console.without_model(work, first)
+        self.assertEqual(moved["set"], fish)
+        self.assertEqual(console.without_model(moved, fish)["sets"], moved["sets"])     # the last model stays
+        self.assertEqual(len(work["sets"]), 2)                              # a copy each time
+
+    def test_cancel_leaves_settings_untouched(self):
+        """Edit provider changes a working copy; nothing reaches settings.json until Save."""
+        written = talkback.SETTINGS.read_bytes() if talkback.SETTINGS.exists() else None
+        work = json.loads(json.dumps(self.source))
+        work, _ = console.with_model(work, self.FISH, "alloy")
+        work, _ = console.edited_model(work, work["sets"][0]["name"], "x/y", "nova")
+        work = console.without_model(work, work["sets"][1]["name"])
+        self.assertEqual(self.source, self.before)
+        self.assertEqual(talkback.Settings().source("openrouter"), self.saved.source("openrouter"))
+        self.assertEqual(talkback.SETTINGS.read_bytes() if talkback.SETTINGS.exists() else None, written)
 
 
 @unittest.skipUnless(HAVE_CONSOLE, "the console needs tkinter")

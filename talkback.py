@@ -10,6 +10,7 @@ import asyncio
 import copy
 import ctypes
 import datetime
+import hashlib
 import json
 import os
 import queue
@@ -20,6 +21,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -42,7 +44,12 @@ AUDIO = None             # this process's own temp folder for speech, made on th
 # The two ways a source can be spoken. `openai` covers OpenRouter, Groq and anything else that speaks the
 # OpenAI /audio/speech shape; `microsoft` is edge-tts and needs no key.
 ENGINES = {"openai": "an OpenAI-compatible /audio/speech endpoint, with a key",
+           "cartesia": "Cartesia's own /tts/bytes endpoint, with a key",
            "microsoft": "edge-tts, no key needed"}
+KEYED = ("openai", "cartesia")          # the engines that take base_url, key and a model
+CARTESIA_VERSION = "2026-08-14"         # the Cartesia-Version header; the only version in Cartesia's spec on 20 Nov 2026
+CARTESIA_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+_CARTESIA_VOICES = {}                   # voice name -> id, looked up once per process
 
 # Three layers, in the tray and in this file: a source (endpoint + key), its voice sets (one model each), and the
 # voices inside a set. The primary source is tried first and the keyless Windows voice second, so there is always
@@ -66,7 +73,7 @@ SOURCES = [
                            "en-AU-NatashaNeural"]}]},
 ]
 DEFAULTS = {"version": SETTINGS_VERSION, "enabled": True, "port": 47800, "primary": "openrouter",
-            "sources": SOURCES}
+            "sources": SOURCES, "talkers": {}, "pythonw": ""}
 RENAMED_LABELS = {"Default (Free)": "Free (for Windows)"}   # an older name, kept so a saved file picks it up
 
 
@@ -170,6 +177,82 @@ def what_to_say(message):
     return _strip_for_speech(message), "whole"
 
 
+# ── Talkers: each agent folder send.py names has its own voice ──────────────────────────────────
+
+MAX_TALKERS = 200                 # past this the longest unheard goes, never one that was set in the console
+MAX_NAME = 60
+
+
+def clean_talker(raw):
+    """The talker of a request, {"id", "name", "folder"}, or None when it is not one."""
+    try:
+        talker_id = str(uuid.UUID(raw["id"]))
+        name = str(raw.get("name") or "").strip()[:MAX_NAME] or talker_id[:8]
+        return {"id": talker_id, "name": name, "folder": str(raw.get("folder") or "")[:120]}
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def clean_choice(raw):
+    """A custom voice, {"source", "set", "voice"}, or None when it is not whole."""
+    parts = {key: str(raw.get(key) or "") for key in ("source", "set", "voice")} if isinstance(raw, dict) else {}
+    return parts if parts and all(parts.values()) else None
+
+
+def _old_choice(row, primary):
+    """A row from before a choice named its source and set: `primary: true` or a voice name, both of the primary set."""
+    voice = row.get("voice")
+    if primary is None or not (row.get("primary") is True or isinstance(voice, str) and voice):
+        return voice
+    chosen = active_set(primary)
+    return {"source": primary["id"], "set": chosen["name"],
+            "voice": chosen["voice"] if row.get("primary") is True else voice}
+
+
+def clean_talkers(raw, primary=None):
+    """(talkers, problems): {id: row} as settings.json keeps it, without the rows that cannot be used.
+    `primary` is the primary source, which an older row's voice belonged to."""
+    if raw is None:
+        return {}, []
+    if not isinstance(raw, dict):
+        return {}, ["talkers is not a table; it is not used"]
+    talkers = {}
+    for talker_id, row in raw.items():
+        talker = clean_talker(dict(row, id=talker_id)) if isinstance(row, dict) else None
+        if talker:
+            talkers[talker["id"]] = {
+                "name": talker["name"], "folder": talker["folder"], "voice": clean_choice(_old_choice(row, primary)),
+                "first": str(row.get("first") or ""), "last": str(row.get("last") or ""),
+                **({"edited": True} if row.get("edited") else {})}
+    dropped = len(raw) - len(talkers)
+    return talkers, [f"talkers: {dropped} unusable rows dropped"] if dropped else []
+
+
+def automatic_voice(talker_id, voice_set):
+    """A voice of this set picked by a hash of the id: the same on every start and machine, never the primary one."""
+    primary, voices = voice_set["voice"], voice_set.get("voices") or []
+    if not voices:
+        return primary
+    place = int.from_bytes(hashlib.sha256(talker_id.encode("utf-8")).digest()[:8], "big") % len(voices)
+    if voices[place] == primary:       # the next one along: only the talkers that landed here move
+        place = (place + 1) % len(voices)
+    return voices[place]
+
+
+def custom_voice(settings, row):
+    """(source, its voice set with the chosen voice) for a talker row's custom voice, or None when it has none or
+    the source, set or voice is no longer there to speak."""
+    choice = row and row["voice"]
+    if not choice:
+        return None
+    for entry in settings["sources"]:
+        if entry["id"] == choice["source"] and entry.get("enabled", True):
+            for item in entry["sets"]:
+                if item["name"] == choice["set"] and choice["voice"] in [*item.get("voices", []), item["voice"]]:
+                    return entry, dict(item, voice=choice["voice"])
+    return None
+
+
 # ── Sources: one endpoint, one key, one voice each ───────────────────────────────────────────────
 
 SOURCE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
@@ -194,7 +277,7 @@ def clean_set(spec, index, engine):
     entry = {"name": name, "voice": voice,
              "voices": list(dict.fromkeys(str(v).strip() for v in voices if str(v).strip()))
                        if isinstance(voices, list) else []}
-    if engine == "openai":
+    if engine in KEYED:
         model = str(spec.get("model") or "").strip()
         if not model:
             return None, f"{name}: no model"
@@ -241,7 +324,7 @@ def clean_source(spec, index=0):
     label = str(spec.get("label") or sid)
     entry = {"id": sid, "label": RENAMED_LABELS.get(label, label), "engine": engine,
              "enabled": bool(spec.get("enabled", True))}
-    if engine == "openai":
+    if engine in KEYED:
         base = str(spec.get("base_url") or "").strip().rstrip("/")
         if not base.startswith(("https://", "http://")):
             return None, [f"{sid}: base_url must be an http(s) address"]
@@ -500,8 +583,12 @@ class Settings:
             if primary is not None:
                 self.problems.append(f"primary {primary!r} cannot speak; using {usable[0] if usable else 'nothing'}")
             primary = usable[0] if usable else None
+        talkers, problems = clean_talkers(saved.get("talkers"),
+                                          next((entry for entry in sources if entry["id"] == primary), None))
+        self.problems += problems
         self.data = {"version": SETTINGS_VERSION, "enabled": True, "port": port,
-                     "primary": primary, "sources": sources}
+                     "primary": primary, "sources": sources, "talkers": talkers,
+                     "pythonw": str(saved.get("pythonw") or "")}
         self.save()
         for problem in self.problems:
             log("settings: " + problem)
@@ -536,6 +623,33 @@ class Settings:
         entry["enabled"] = True
         self.data["primary"] = entry["id"]
         self.save()
+
+    def note_talker(self, talker, now=None):
+        """Register a talker on its first spoken reply; after that only `last` moves. The voice is the console's, and
+        the file is read again first so a reply never writes over what the console saved since."""
+        now = now or datetime.datetime.now().isoformat(sep=" ", timespec="seconds")
+        self.reload()
+        talkers = self.data["talkers"]
+        if talker["id"] in talkers:
+            talkers[talker["id"]]["last"] = now
+        else:
+            talkers[talker["id"]] = {"name": talker["name"], "folder": talker["folder"], "voice": None,
+                                     "first": now, "last": now}
+            untouched = sorted((key for key, row in talkers.items() if not row.get("edited")),
+                               key=lambda key: talkers[key]["last"])
+            for key in untouched[:max(len(talkers) - MAX_TALKERS, 0)]:
+                del talkers[key]
+        self.save()
+
+    def set_talker(self, talker_id, **changes):
+        """The console's change to one talker (its `voice`); False when it is no longer listed."""
+        self.reload()
+        row = self.data["talkers"].get(talker_id)
+        if row is None:
+            return False
+        row.update(changes, edited=True)
+        self.save()
+        return True
 
     def reload(self):
         """Re-read settings.json, keeping whether speaking is on (it is on at every start)."""
@@ -579,8 +693,14 @@ def _audio_file(suffix):
 
 
 def microsoft_to_file(text, voice, rate, path):
+    """Speak through edge-tts into `path`. The service sometimes answers a good request with no audio at all
+    (`NoAudioReceived`, about one reply in two on 20 Nov, whatever the text: the same text spoke on the next try),
+    so a new connection is made once before the source counts as failed."""
     import edge_tts
-    asyncio.run(edge_tts.Communicate(text, voice=voice, rate=rate).save(path))
+    try:
+        asyncio.run(edge_tts.Communicate(text, voice=voice, rate=rate).save(path))
+    except edge_tts.exceptions.NoAudioReceived:
+        asyncio.run(edge_tts.Communicate(text, voice=voice, rate=rate).save(path))
 
 
 def _pieces(text, limit=200):
@@ -604,6 +724,45 @@ def _speech_request(entry, piece, fmt=None):
              "response_format": fmt or entry.get("format") or "wav"})
 
 
+def _cartesia_headers(key):
+    return {"Authorization": f"Bearer {key}", "Cartesia-Version": CARTESIA_VERSION,
+            "Content-Type": "application/json", "User-Agent": "talkback"}
+
+
+def _cartesia_origin(entry):
+    """https://api.cartesia.ai from whatever address the source holds (a console entry may carry /tts/sse)."""
+    from urllib.parse import urlsplit
+    parts = urlsplit(entry["base_url"])
+    return f"{parts.scheme}://{parts.netloc}"
+
+
+def cartesia_voice_id(entry, key):
+    """The id Cartesia knows a voice by: an id passes through, a name (`Daniel`) is looked up once."""
+    import urllib.parse
+    import urllib.request
+    voice = entry["voice"].strip()
+    if CARTESIA_ID.match(voice):
+        return voice
+    cached = _CARTESIA_VOICES.get(voice.casefold())
+    if cached:
+        return cached
+    url = f"{_cartesia_origin(entry)}/voices?" + urllib.parse.urlencode({"q": voice, "limit": 100})
+    with urllib.request.urlopen(urllib.request.Request(url, headers=_cartesia_headers(key)), timeout=20) as resp:
+        found = json.loads(resp.read().decode("utf-8")).get("data", [])
+    match = next((item["id"] for item in found if str(item.get("name", "")).strip().casefold() == voice.casefold()), "")
+    if not match:
+        raise ValueError(f"Cartesia has no voice named {voice!r}; use a voice id")
+    _CARTESIA_VOICES[voice.casefold()] = match
+    return match
+
+
+def _cartesia_request(entry, piece, key):
+    """(url, payload) for Cartesia's text-to-speech: one WAV (16-bit PCM, 44.1 kHz) back."""
+    return (_cartesia_origin(entry) + "/tts/bytes",
+            {"model_id": entry["model"], "transcript": piece, "voice": {"id": cartesia_voice_id(entry, key)},
+             "language": "en", "output_format": {"container": "wav", "encoding": "pcm_s16le", "sample_rate": 44100}})
+
+
 def openai_to_file(text, entry, key, path):
     """Speak through an OpenAI-compatible endpoint and save the audio as one WAV file.
 
@@ -620,16 +779,21 @@ def openai_to_file(text, entry, key, path):
     pieces = _pieces(text, limit) if limit and len(text) > limit else [text]
 
     def ask(piece, fmt=None):
-        url, payload = _speech_request(entry, piece, fmt)
-        req = urllib.request.Request(url, method="POST", data=json.dumps(payload).encode("utf-8"),
-                                     headers={"Authorization": f"Bearer {key}",
-                                              "Content-Type": "application/json", "User-Agent": "talkback"})
+        if entry.get("engine") == "cartesia":
+            url, payload = _cartesia_request(entry, piece, key)
+            headers = _cartesia_headers(key)
+        else:
+            url, payload = _speech_request(entry, piece, fmt)
+            headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json", "User-Agent": "talkback"}
+        req = urllib.request.Request(url, method="POST", data=json.dumps(payload).encode("utf-8"), headers=headers)
         with urllib.request.urlopen(req, timeout=20) as resp:
             return resp.read(), resp.headers.get("Content-Type", "")
 
     def fetch(piece):
         """One piece of text; when the endpoint refuses the format, the other one it may speak in."""
         fmt = entry.get("format") or "wav"
+        if entry.get("engine") == "cartesia":
+            return ask(piece)
         try:
             return ask(piece, fmt)
         except urllib.error.HTTPError as error:
@@ -693,11 +857,11 @@ class Speaker(threading.Thread):
             source = item.get("source", "unknown")
             try:
                 self.speak(item.get("text", ""), source, item.get("only", ""),
-                           item.get("set", ""), item.get("voice", ""))
+                           item.get("set", ""), item.get("voice", ""), item.get("talker"))
             except Exception as e:
                 log(f"{source}: FAILED {e}")
 
-    def speak(self, message, source, only="", set_name="", voice=""):
+    def speak(self, message, source, only="", set_name="", voice="", talker=None):
         """Speak this reply. `only` is the one source a test line may use; `set_name`/`voice` the one voice in it.
 
         A test passes a voice without choosing it, so testing a voice changes nothing about what speaks next.
@@ -711,7 +875,11 @@ class Speaker(threading.Thread):
             return
         self.stop.clear()
         skipped = []
+        row = self.settings["talkers"].get(talker["id"]) if talker else None
+        custom = None if voice else custom_voice(self.settings, row)
         order = speech_order(self.settings)
+        if custom:                         # its own source first, then the usual order
+            order.sort(key=lambda entry: entry["id"] != custom[0]["id"])
         if only:
             order = [entry for entry in order if entry["id"] == only]
         for entry in order:
@@ -724,6 +892,11 @@ class Speaker(threading.Thread):
                 chosen = next((item for item in entry["sets"] if item["name"] == set_name), None)
                 if chosen is not None:
                     voice_set = dict(chosen, voice=voice)
+            elif custom:                   # any other source here is a fallback, and speaks as it always does
+                if entry["id"] == custom[0]["id"]:
+                    voice_set = custom[1]
+            elif talker and entry["id"] == self.settings["primary"]:
+                voice_set = dict(voice_set, voice=automatic_voice(talker["id"], voice_set))
             request = request_entry(entry, voice_set)
             # edge-tts answers in MP3: the suffix is what tells MCI how to decode it, so it must match the bytes
             path = _audio_file(".mp3" if entry["engine"] == "microsoft" else ".wav")
@@ -734,7 +907,7 @@ class Speaker(threading.Thread):
                     openai_to_file(text, request, key, path)
                 why = play(path, self.stop)
             except Exception as e:
-                log(_without_reply(f"{source}: {entry['id']}/{voice_set['name']} did not speak ({e!r}); "
+                log(_without_reply(f"{source}: {entry['id']}/{voice_set['name']} did not speak ({e!r}), {len(text)} chars; "
                                    "the next source is tried", text))
                 skipped.append(entry["id"] + " (failed)")
                 continue
@@ -744,6 +917,8 @@ class Speaker(threading.Thread):
             skipped_text = f"; skipped {', '.join(skipped)}" if skipped else ""
             log(f"{source}: spoke {how}, {len(text)} of {len(message)} chars, "
                 f"{entry['id']}/{voice_set['name']} {request['voice']}, {why}{skipped_text}")
+            if talker and not voice:       # a console test is not an agent being heard
+                self.settings.note_talker(talker)
             return
         log(f"{source}: nothing spoke, {len(message)}-char reply; tried {', '.join(skipped) or 'no source'}")
 
@@ -752,7 +927,8 @@ class Speaker(threading.Thread):
 
 def status_view(settings):
     """The settings with every key path and key value taken out: the status page never describes the machine."""
-    view = {key: value for key, value in settings.data.items() if key != "sources"}
+    view = {key: value for key, value in settings.data.items()
+            if key not in ("sources", "talkers", "pythonw")}          # folders and paths are the machine's own
     view["sources"] = [
         dict(entry, key="missing" if not key_for(entry)
              else "file" if str(entry.get("key") or "").startswith("file:") else "env")
@@ -811,13 +987,14 @@ def make_handler(settings, speaker, on_change=None):
                 only = str(body.get("only") or "")     # a test line: this one source, and maybe one voice
                 set_name = str(body.get("set") or "")
                 voice = str(body.get("voice") or "")
+                talker = clean_talker(body.get("talker"))
             except Exception:
                 return self.send_error(400, "send JSON {\"text\": ..., \"source\": ...}")
             if speaker.items.qsize() >= MAX_QUEUE:
                 log(f"{body.get('source', 'unknown')}: dropped, {speaker.items.qsize()} replies were waiting")
                 return self.send_error(429)
             speaker.items.put({"text": text, "source": str(body.get("source", "unknown")),
-                               "only": only, "set": set_name, "voice": voice})
+                               "only": only, "set": set_name, "voice": voice, "talker": talker})
             self.send_response(202)
             self.end_headers()
 
@@ -1063,8 +1240,8 @@ def already_answering(port):
 def already_running(port):
     """The words the second copy shows. Not an error, so it says where the running copy is instead."""
     return (f"Agent Talkback is already running on port {port}, so this copy stopped.\n\n"
-            "Use the tray icon: click it to switch speaking on or off, or right-click it for the menu, "
-            "including Open Agent Talkback to change the voices.")
+            "Click the tray icon to switch speaking on or off. Right-click it for the menu; "
+            "Open console there changes the voices.")
 
 
 def notice(words):
@@ -1082,6 +1259,16 @@ def second_copy(port):
         notice(already_running(port))
 
 
+def keep_pythonw(settings):
+    """Store the pythonw this copy runs on, so a send from any Python can start Talkback again."""
+    try:
+        import PIL  # noqa: F401
+        import pystray  # noqa: F401
+    except ImportError:               # this Python cannot show the tray: not one to start Talkback with
+        return
+    settings["pythonw"] = str(Path(sys.executable).with_name("pythonw.exe"))
+
+
 def main():
     settings = Settings()
     port = settings["port"]
@@ -1091,6 +1278,7 @@ def main():
         server = LocalServer(("127.0.0.1", port), None)
     except OSError:
         return second_copy(port)
+    keep_pythonw(settings)
     speaker = Speaker(settings)
     wake = []                      # tray() puts its repaint here, so the console's switch can move the icon
     server.RequestHandlerClass = make_handler(settings, speaker, lambda: [repaint() for repaint in wake])

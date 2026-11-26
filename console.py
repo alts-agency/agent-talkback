@@ -1,11 +1,11 @@
 """Agent Talkback's setup console: the one window a person needs.
 
-    python console.py          (or  Open Agent Talkback  in the tray menu)
+    python console.py          (or  Open console  in the tray menu)
 
 It shows the voice that speaks (Primary) and Microsoft Edge's free Windows voice, which takes over when the primary
-voice fails (Backup), lists the providers it can call with the key each one has — alphabetically, with the primary
-one marked and a button on every other row that makes it primary — edits any of them in place, lists every voice
-with a test beside it, switches Agent Talkback on at login, and points at the project's website. It uses Windows'
+voice fails (Backup). It lists the providers with the key each one has, alphabetically, with the primary one marked
+and a button on every other row that makes it primary. It edits any of them, shows every voice as a tile with its own
+Test, starts Agent Talkback at login, and links to the project's website. It uses Windows'
 light or dark mode, whichever Windows is in.
 
 Every change is written to settings.json and the running program is asked to reload, so nothing restarts and the
@@ -37,7 +37,8 @@ import talkback  # noqa: E402
 WEBSITE = "https://alts.agency"      # the one link in the window, at the very bottom
 PACKAGES = {"edge_tts": "edge-tts", "pystray": "pystray", "PIL": "Pillow"}
 KEY_WORDS = {"ready": "Set", "missing": "Not set", "outside": "Outside secrets"}
-MAX_LISTED = 150          # rows drawn at once in the voice list; the filter finds the rest
+MAX_LISTED = 150          # voices drawn at once in the voice list; the filter finds the rest
+TILES_ACROSS = 3          # voices on one line of that list
 
 
 def font(size, weight="normal"):
@@ -211,9 +212,9 @@ def key_colour(entry, colours):
     return {"ready": colours["accent"], "missing": colours["muted"], "outside": colours["warn"]}[state]
 
 
-def voice_line(entry):
+def voice_line(entry, voice_set=None):
     """The one line per voice: 'nadine (HeyGen | OpenRouter)', 'Guy (Microsoft Edge | Free)'."""
-    voice_set = talkback.active_set(entry)
+    voice_set = voice_set or talkback.active_set(entry)
     where = "Free" if entry["engine"] == "microsoft" else entry["label"]
     return f"{talkback.voice_name(voice_set['voice'])} ({voice_set['name']} | {where})"
 
@@ -225,7 +226,7 @@ def free_source(settings):
 
 def provider_rows(settings):
     """The keyed sources, alphabetically by provider name: the only order this window shows them in."""
-    return sorted((entry for entry in settings["sources"] if entry["engine"] == "openai"),
+    return sorted((entry for entry in settings["sources"] if entry["engine"] in talkback.KEYED),
                   key=lambda entry: str(entry["label"]).casefold())
 
 
@@ -238,9 +239,147 @@ def new_id(label, taken):
     return source_id
 
 
+def model_words(entry):
+    """The Model column: the model in use, and ' +1', ' +2' when the provider holds more."""
+    others = len(entry["sets"]) - 1
+    model = talkback.active_set(entry).get("model") or "—"
+    return f"{model} +{others}" if others else model
+
+
+def set_name_for(model, taken=()):
+    """A voice set named after its model: 'fish-audio/s2.1-pro-free:free' is 's2.1-pro-free', then ' 2', ' 3'."""
+    stem = model.rsplit("/", 1)[-1].split(":", 1)[0] or model
+    name, number = stem, 2
+    while name in taken:
+        name, number = f"{stem} {number}", number + 1
+    return name
+
+
+def _model_problem(entry, model, voice, other_than=None):
+    """Why this model and voice cannot go into `entry` (besides the set named `other_than`), or ''."""
+    if not model:
+        return "Enter the model id."
+    if not voice:
+        return "Enter a voice id."
+    if model in {voice_set.get("model") for voice_set in entry["sets"] if voice_set["name"] != other_than}:
+        return f"{entry['label']} already has {model}."
+    return ""
+
+
+def _cleaned(spec, count):
+    """(source, problem) once `clean_source()` has passed the spec with all `count` of its sets kept."""
+    clean, problems = talkback.clean_source(spec)
+    if clean is None or len(clean["sets"]) != count:
+        return None, problems[0] if problems else "That model cannot be used."
+    return clean, ""
+
+
+def with_model(entry, model, voice, limit=None):
+    """(source, problem): a copy of `entry` holding one more model, or why not. The set in use stays the same.
+
+    The new set copies the format of the set in use: same endpoint, likely the same answer, and the program asks
+    again in the other format when a model refuses it.
+    """
+    model, voice = model.strip(), voice.strip()
+    problem = _model_problem(entry, model, voice)
+    if problem:
+        return None, problem
+    if len(entry["sets"]) >= talkback.MAX_SETS:
+        return None, (f"{entry['label']} already has {talkback.MAX_SETS} models, the most a provider holds. "
+                      "Raise MAX_SETS in talkback.py to add more.")
+    voice_set = {"name": set_name_for(model, {item["name"] for item in entry["sets"]}), "model": model,
+                 "voice": voice, "voices": [voice]}
+    if limit:
+        voice_set["request_limit"] = int(limit)
+    if talkback.active_set(entry).get("format"):
+        voice_set["format"] = talkback.active_set(entry)["format"]
+    spec = copy.deepcopy(entry)
+    spec["sets"].append(voice_set)
+    return _cleaned(spec, len(spec["sets"]))
+
+
+def edited_model(entry, name, model, voice, limit=None):
+    """(source, problem): a copy of `entry` whose model `name` has this model, voice and limit, or why not.
+
+    The set keeps its format and its place, and its name while the model id stays; a changed model renames it after
+    the new model, so the voice line never names a model that is gone. A new voice goes first in its voices.
+    """
+    model, voice = model.strip(), voice.strip()
+    problem = _model_problem(entry, model, voice, other_than=name)
+    if problem:
+        return None, problem
+    spec = copy.deepcopy(entry)
+    voice_set = next(item for item in spec["sets"] if item["name"] == name)
+    if model != voice_set.get("model"):
+        renamed = set_name_for(model, {item["name"] for item in spec["sets"] if item is not voice_set})
+        if spec.get("set") == name:
+            spec["set"] = renamed
+        voice_set["name"] = renamed
+    voice_set.update(model=model, voice=voice)
+    if voice not in voice_set.get("voices", []):
+        voice_set["voices"] = [voice, *voice_set.get("voices", [])]
+    if limit:
+        voice_set["request_limit"] = int(limit)
+    else:
+        voice_set.pop("request_limit", None)
+    return _cleaned(spec, len(spec["sets"]))
+
+
+def without_model(entry, name):
+    """A copy of `entry` without the model `name`; the last model stays. When the one in use goes, the first is."""
+    spec = copy.deepcopy(entry)
+    if len(spec["sets"]) < 2:
+        return spec
+    in_use = talkback.active_set(spec)["name"]
+    spec["sets"] = [item for item in spec["sets"] if item["name"] != name]
+    spec["set"] = spec["sets"][0]["name"] if in_use == name else in_use
+    return spec
+
+
+def model_tabs(entry):
+    """The tabs over the Primary voice list: 'Model 1', 'Model 2' ... in settings' order, the one in use marked."""
+    in_use = talkback.active_set(entry)["name"]
+    return [{"set": voice_set["name"], "label": f"Model {number}", "model": voice_set.get("model") or voice_set["name"],
+             "in_use": voice_set["name"] == in_use} for number, voice_set in enumerate(entry["sets"], start=1)]
+
+
+def voice_rows(entry, set_name=None):
+    """One model's voices in settings' order (the model in use when no name is given), each voice once."""
+    voice_set = next((item for item in entry["sets"] if item["name"] == set_name), None) or talkback.active_set(entry)
+    return [{"set": voice_set["name"], "voice": voice, "note": voice_set["name"]}
+            for voice in dict.fromkeys([*voice_set.get("voices", []), voice_set["voice"]])]
+
+
+def automatic_choice(settings, talker_id):
+    """The automatic voice as a choice: where a folder's custom voice starts when it is switched on."""
+    entry = settings.source()
+    voice_set = talkback.active_set(entry)
+    return {"source": entry["id"], "set": voice_set["name"],
+            "voice": talkback.automatic_voice(talker_id, voice_set)}
+
+
+def talker_rows(settings):
+    """Every talker heard, the last heard first: its folder, whether its custom voice is on, the voice that speaks
+    now as a choice and as words, and `lacking`, a chosen voice that is no longer there."""
+    rows = []
+    for talker_id, row in sorted(settings["talkers"].items(), key=lambda item: item[1]["last"], reverse=True):
+        custom = talkback.custom_voice(settings, row)
+        if custom:
+            entry, voice_set = custom
+            choice = dict(row["voice"])
+        else:
+            choice = automatic_choice(settings, talker_id)
+            entry = settings.source()
+            voice_set = dict(talkback.active_set(entry), voice=choice["voice"])
+        rows.append({"id": talker_id, "folder": row["folder"] or row["name"], "on": row["voice"] is not None,
+                     "choice": choice, "label": voice_line(entry, voice_set),
+                     "lacking": row["voice"]["voice"] if row["voice"] and not custom else ""})
+    return rows
+
+
 def test_words(voice):
     """What Test says, in the voice it is testing."""
-    return f"Testing talkback in {talkback.voice_name(voice)}'s Voice."
+    return f"Testing Talkback in {talkback.voice_name(voice)}'s voice."
 
 
 # ── Small widgets: a card, a button, a scrolling list ───────────────────────────────────────────────
@@ -352,6 +491,18 @@ class Scroll(tk.Frame):
         self.canvas.yview_moveto(first + (event.y - start) / max(self.track.winfo_height(), 1) * (1 - span))
 
 
+def table(parent, columns, colours):
+    """A table's head and every one of its rows share one grid, so a column is one width across all of them."""
+    frame = tk.Frame(parent, bg=colours["card"], padx=18)
+    frame.pack(fill="x")
+    for index, (name, weight) in enumerate(columns):
+        frame.grid_columnconfigure(index, weight=weight)
+        tk.Label(frame, text=name.upper(), bg=colours["card"], fg=colours["muted"], font=font(8, "bold"),
+                 anchor="w").grid(row=0, column=index, sticky="w", pady=(13, 9))
+    frame.grid_columnconfigure(len(columns), weight=0)
+    return frame
+
+
 def hover(widgets, colours, colour_name="hover", cursor="hand2"):
     """Light a row up as the pointer crosses it (and every label inside it)."""
     normal = colours["card"]
@@ -449,9 +600,8 @@ class Console(tk.Tk):
         left.pack(side="left", fill="x", expand=True)
         tk.Label(left, text="Agent Talkback", bg=self.c["bg"], fg=self.c["text"],
                  font=font(22, "bold")).pack(anchor="w")
-        tk.Label(left, text="Release as open-source by Alts Agency. This Agent Talkback tool allows your agents to speak "
-                            "back to you as they reply. Updates and instructions on how to use Agent Talkback can be "
-                            "found on our website.", bg=self.c["bg"], fg=self.c["muted"], font=font(10),
+        tk.Label(left, text="Released as open source by Alts Agency. Agent Talkback reads your agents' replies out loud. "
+                            "You can find updates and instructions on our website.", bg=self.c["bg"], fg=self.c["muted"], font=font(10),
                  justify="left", wraplength=720).pack(anchor="w", pady=(4, 0))
 
         self.link = tk.Label(header, text="alts.agency \u2197", bg=self.c["bg"], fg=self.c["accent"],
@@ -468,25 +618,30 @@ class Console(tk.Tk):
                                        self.change_primary, first=True)
         divider(voices, self.c)
         self.secondary = self._voice_row(voices, "BACKUP VOICE",
-                                         "Microsoft Edge Voice takes over when the primary voice fails. Needs "
-                                         "internet connectivity to Microsoft servers. No key required.",
+                                         "Microsoft Edge's voice takes over when the primary voice fails. It needs "
+                                         "Microsoft's servers online, but no key.",
                                          self.change_secondary)
 
-        self._section(body, "Providers", "Your voices will use the primary voice you have selected below.",
+        self._section(body, "Providers", "Your primary voice comes from one of these.",
                       ("+  Add provider", self.add_provider))
         self.provider_card = card(body, self.c)
         self.provider_card.pack(fill="x", padx=24, pady=(0, 18))
 
         switches = card(body, self.c)
         switches.pack(fill="x", padx=24, pady=(0, 28))
+        agents = self._card_row(switches, "Voices by Agent",
+                                "You can customize different voices for different agents if you run an agent fleet.")
+        self.agents_change = button(agents, "Change", self.change_talkers, self.c, "ghost")
+        self.agents_change.pack(side="right", pady=(2, 0))
+        divider(switches, self.c)
         self.voice_switch = self._switch_row(
             switches, "Talkback Voice",
-            "We will only send data out from Agent Talkback to the selected endpoints if this is turned on.",
+            "Reply text goes to your voice providers only while this is on.",
             self.settings["enabled"], self.toggle_speaking)
         divider(switches, self.c)
         self.startup_on = tk.BooleanVar(value=startup_enabled())
         self.switch = self._switch_row(switches, "Start with Windows",
-                                       "Agent Talkback waits in the tray from the moment you log in.",
+                                       "Agent Talkback starts in the tray when you log in.",
                                        self.startup_on.get(), self.toggle_startup)
         divider(switches, self.c)
         self.desktop_on = tk.BooleanVar(value=desktop_enabled())
@@ -504,8 +659,8 @@ class Console(tk.Tk):
         self.install = button(self.bottom, "Install packages", self.install_packages, self.c, "ghost")
         self.bind("<Escape>", lambda event: self.destroy())
 
-    def _switch_row(self, parent, title, note, on, command):
-        """One switch in a card: the words on the left, the switch on the right."""
+    def _card_row(self, parent, title, note):
+        """One setting in a card: the words on the left, room for its control on the right."""
         row = tk.Frame(parent, bg=self.c["card"], padx=18, pady=14)
         row.pack(fill="x")
         words = tk.Frame(row, bg=self.c["card"])
@@ -513,6 +668,11 @@ class Console(tk.Tk):
         tk.Label(words, text=title, bg=self.c["card"], fg=self.c["text"], font=font(11, "bold")).pack(anchor="w")
         tk.Label(words, text=note, bg=self.c["card"], fg=self.c["muted"], font=font(9), justify="left",
                  wraplength=560).pack(anchor="w", pady=(2, 0))
+        return row
+
+    def _switch_row(self, parent, title, note, on, command):
+        """One switch in a card: the words on the left, the switch on the right."""
+        row = self._card_row(parent, title, note)
         switch = Switch(row, self.c, on, command)
         switch.pack(side="right", pady=(2, 0))
         return switch
@@ -543,17 +703,6 @@ class Console(tk.Tk):
         if action:
             button(head, action[0], action[1], self.c, "ghost", background=self.c["bg"]).pack(side="right", pady=(4, 0))
 
-    def _table(self, parent, columns):
-        """A table's head and every one of its rows share one grid, so a column is one width across all of them."""
-        table = tk.Frame(parent, bg=self.c["card"], padx=18)
-        table.pack(fill="x")
-        for index, (name, weight) in enumerate(columns):
-            table.grid_columnconfigure(index, weight=weight)
-            tk.Label(table, text=name.upper(), bg=self.c["card"], fg=self.c["muted"], font=font(8, "bold"),
-                     anchor="w").grid(row=0, column=index, sticky="w", pady=(13, 9))
-        table.grid_columnconfigure(len(columns), weight=0)
-        return table
-
     # ── Showing the current state ──
 
     def _stamp(self):
@@ -566,8 +715,8 @@ class Console(tk.Tk):
         """Follow a change made in the tray (or by hand) while this window is open."""
         stamp = self._stamp()
         if stamp and stamp != self.stamp:
-            self.stamp = stamp
             self.settings = talkback.Settings()
+            self.stamp = self._stamp()    # loading writes the file: without this the window rewrites it every 2 s
             self.refresh()
         else:
             self.show_speaking()      # the tray can be clicked while this window is open: follow it
@@ -598,8 +747,9 @@ class Console(tk.Tk):
         primary = self.settings.source()
         self.primary["value"].configure(text=voice_line(primary) if primary else "\u2014")
         backup = free_source(self.settings)
-        self.secondary["value"].configure(text=voice_line(backup) if backup else "\u2014 none configured \u2014")
+        self.secondary["value"].configure(text=voice_line(backup) if backup else "No voice set up")
         self.secondary["change"].configure(state="normal" if backup else "disabled")
+
 
         self._provider_table()
 
@@ -632,7 +782,7 @@ class Console(tk.Tk):
 
     def _provider_table(self):
         rows = provider_rows(self.settings)
-        signature = tuple((entry["id"], entry["label"], talkback.active_set(entry).get("model"),
+        signature = tuple((entry["id"], entry["label"], model_words(entry),
                            key_words(entry), entry["id"] == self.settings["primary"]) for entry in rows)
         if signature == self.provider_signature:
             return                    # nothing in the table changed, so it is not redrawn (a redraw is a white flash)
@@ -640,14 +790,14 @@ class Console(tk.Tk):
         for child in self.provider_card.winfo_children():
             child.destroy()
         if not rows:
-            self._empty_row(self.provider_card, "No provider yet. Add one to give a voice a key.")
+            self._empty_row(self.provider_card, "No providers yet. Add one and give it a key.")
             return
-        table = self._table(self.provider_card, (("Provider", 4), ("Model", 3), ("Key", 2)))
+        grid = table(self.provider_card, (("Provider", 4), ("Model", 3), ("Key", 2)), self.c)
         for number, entry in enumerate(rows):
-            self._provider_row(table, number + 1, entry)
+            self._provider_row(grid, number + 1, entry)
 
     def _provider_row(self, table, row, entry):
-        """One provider: its name (marked when it is primary, or the button that makes it so), model, key, Edit.
+        """One provider: its name (marked when primary, or the button that makes it so), model, key and Edit.
 
         Only the buttons do anything. The row does not open and does not light up under the pointer, so a mis-click
         on a table is a mis-click on nothing.
@@ -662,7 +812,7 @@ class Console(tk.Tk):
         else:
             button(name, "Set as primary", lambda entry=entry: self.set_primary(entry), self.c,
                    "ghost").pack(side="left", padx=(8, 0))
-        tk.Label(table, text=talkback.active_set(entry).get("model") or "\u2014", bg=self.c["card"],
+        tk.Label(table, text=model_words(entry), bg=self.c["card"],
                  fg=self.c["muted"], font=font(10), anchor="w").grid(row=row, column=1, sticky="w",
                                                                      padx=(0, 14), pady=11)
         tk.Label(table, text=key_words(entry), bg=self.c["card"], fg=key_colour(entry, self.c),
@@ -703,6 +853,9 @@ class Console(tk.Tk):
         free = free_source(self.settings)
         if free:
             VoiceDialog(self, free, secondary=True).show()
+
+    def change_talkers(self):
+        TalkersDialog(self).show()
 
     def toggle_startup(self, wanted):
         """The switch moves at once; the shortcut is written on a thread, and snaps back if it could not be written."""
@@ -752,14 +905,15 @@ class Console(tk.Tk):
 # ── The dialogs ───────────────────────────────────────────────────────────────────────────────────
 
 class Dialog(tk.Toplevel):
-    """A centered window over the console, in the same palette."""
+    """A centered window over the console (or over the dialog it was opened from), in the same palette."""
 
-    def __init__(self, app, title, width, height):
-        super().__init__(app)
+    def __init__(self, app, title, width, height, over=None):
+        super().__init__(over or app)
         self.app, self.c, self.width, self.height = app, app.c, width, height
+        self.over = over or app
         self.title(title)
         self.configure(bg=self.c["bg"])
-        self.transient(app)
+        self.transient(self.over)
         self.resizable(False, False)
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self.bind("<Escape>", lambda event: self.destroy())
@@ -767,12 +921,21 @@ class Dialog(tk.Toplevel):
 
     def show(self):
         self.update_idletasks()
-        app = self.app
-        x = app.winfo_rootx() + (app.winfo_width() - self.width) // 2
-        y = app.winfo_rooty() + (app.winfo_height() - self.height) // 3
+        self.fits = not self.height                              # None: as tall as what it holds, so nothing is cut
+        self.height = self.height or self.winfo_reqheight()
+        over = self.over
+        x = over.winfo_rootx() + (over.winfo_width() - self.width) // 2
+        y = over.winfo_rooty() + (over.winfo_height() - self.height) // 3
         self.geometry(f"{self.width}x{self.height}+{max(x, 0)}+{max(y, 0)}")
         dark_title_bar(self, self.c is DARK)
         self.wait_window(self)
+
+    def refit(self):
+        """After the content changed: as tall as it now is, where it already stands."""
+        if getattr(self, "fits", False):
+            self.update_idletasks()
+            self.height = self.winfo_reqheight()
+            self.geometry(f"{self.width}x{self.height}")
 
     def head(self, title, note=""):
         box = tk.Frame(self, bg=self.c["bg"], padx=22)
@@ -796,44 +959,16 @@ class Dialog(tk.Toplevel):
             self.note.pack(side="left")
         return bar
 
-
-class ProviderDialog(Dialog):
-    """Add or edit a provider: the name, endpoint, model, voice and key each request is made with."""
-
-    def __init__(self, app, entry):
-        super().__init__(app, "Edit provider" if entry else "Add provider", 580, 660)
-        self.entry, self.entries = entry, {}
-        self.head("Edit provider" if entry else "Add provider",
-                  "These are the values used to call the provider's speech endpoint. The key is saved in "
-                  "secrets/, never in settings.json and never in git.")
+    def message_line(self):
+        """The line above the buttons where a form says why it cannot save."""
         self.note = tk.Label(self, text="", bg=self.c["bg"], fg=self.c["muted"], font=font(9), anchor="w",
                              justify="left", wraplength=self.width - 44, padx=22)
         self.note.pack(side="bottom", fill="x")
-        self.footer([("Cancel", self.destroy, "ghost"),
-                     ("Save" if entry else "Add provider", self.save, "accent")])
-        voice_set = talkback.active_set(entry) if entry else {}
-        form = tk.Frame(self, bg=self.c["bg"], padx=22)
-        form.pack(fill="both", expand=True, pady=(0, 6))
-        self._field(form, "name", "Provider name", entry["label"] if entry else "",
-                    "What the tray and this window call it, such as OpenRouter.")
-        self._field(form, "endpoint", "Endpoint", entry.get("base_url", "") if entry else "",
-                    "The OpenAI-compatible base URL, such as https://openrouter.ai/api/v1")
-        self._field(form, "model", "Model", voice_set.get("model", ""),
-                    "The speech model id at that endpoint, such as heygen/heygen-voice-1-turbo:free")
-        self._field(form, "voice", "Voice", voice_set.get("voice", ""),
-                    "The voice id the model answers to. Change… next to Primary voice lists the known ones.")
-        self._field(form, "key", "API key", "", "Leave blank to keep the saved key." if entry
-                    else "Pasted once; it goes into secrets/ and is never shown again.", masked=True)
-        self._field(form, "limit", "Max characters per request",
-                    str(voice_set.get("request_limit", "")) if voice_set.get("request_limit") else "",
-                    "Optional. Only for a model that refuses long text, such as Groq's 200.")
-        self.bind("<Return>", lambda event: self.save())
-        self.entries["name"].focus_set()
 
     def _field(self, parent, key, label, value, hint, masked=False):
         tk.Label(parent, text=label, bg=self.c["bg"], fg=self.c["text"], font=font(9, "bold")).pack(anchor="w",
                                                                                                    pady=(0, 3))
-        entry = entry_box(parent, self.c, show="\u2022" if masked else "")
+        entry = entry_box(parent, self.c, show="•" if masked else "")
         entry.insert(0, value)
         entry.pack(fill="x", ipady=ENTRY_PAD, pady=(0, 2))
         tk.Label(parent, text=hint, bg=self.c["bg"], fg=self.c["muted"], font=font(8), justify="left",
@@ -843,31 +978,116 @@ class ProviderDialog(Dialog):
     def text(self, key):
         return self.entries[key].get().strip()
 
+
+class ProviderDialog(Dialog):
+    """Add or edit a provider. Edit is the one place for a provider: its name, endpoint and key, then its models.
+
+    The models are changed in a working copy (`work`) and written with everything else on Save; Cancel drops them.
+    Add provider keeps one form with the first model, because a provider needs one to exist.
+    """
+
+    VISIBLE_MODELS = 4            # from the fifth model on, the Models table scrolls
+
+    def __init__(self, app, entry):
+        super().__init__(app, "Edit provider" if entry else "Add provider", 640 if entry else 580,
+                         None if entry else 700)
+        self.entry, self.entries = entry, {}
+        self.work = copy.deepcopy(entry) if entry else None
+        self.head("Edit provider" if entry else "Add provider",
+                  "Agent Talkback uses these to call the provider's speech endpoint. The key is saved in "
+                  "secrets/, never in settings.json or git.")
+        self.message_line()
+        self.footer([("Cancel", self.destroy, "ghost"),
+                     ("Save" if entry else "Add provider", self.save, "accent")])
+        form = tk.Frame(self, bg=self.c["bg"], padx=22)
+        form.pack(fill="both", expand=True, pady=(0, 6))
+        self._field(form, "name", "Provider name", entry["label"] if entry else "",
+                    "The name shown in the tray and this window, such as OpenRouter.")
+        self._field(form, "endpoint", "Endpoint", entry.get("base_url", "") if entry else "",
+                    "The OpenAI-compatible base URL, such as https://openrouter.ai/api/v1")
+        if entry:
+            self._field(form, "key", "API key", "", "Leave blank to keep the saved key.", masked=True)
+            self._models(form)
+        else:
+            self._field(form, "model", "Model", "",
+                        "The speech model id at that endpoint, such as heygen/heygen-voice-1-turbo:free")
+            self._field(form, "voice", "Voice", "",
+                        "A voice id this model accepts. Change, next to Primary voice, lists the ones set up.")
+            self._field(form, "key", "API key", "", "Paste it once. It is saved in secrets/ and never shown again.",
+                        masked=True)
+            self._field(form, "limit", "Max characters per request", "",
+                        "Optional. For a model that refuses long text. Groq's limit is 200.")
+        self.bind("<Return>", lambda event: self.save())
+        self.entries["name"].focus_set()
+
+    def _models(self, parent):
+        """The Models part: a head with + Add model on its right, the table, and the line that says when it saves."""
+        head = tk.Frame(parent, bg=self.c["bg"])
+        head.pack(fill="x", pady=(8, 8))
+        tk.Label(head, text="Models", bg=self.c["bg"], fg=self.c["text"], font=font(12, "bold")).pack(side="left")
+        button(head, "+  Add model", lambda: self.open_model(None), self.c, "ghost",
+               background=self.c["bg"]).pack(side="right")
+        self.models_card = card(parent, self.c)
+        self.models_card.pack(fill="x")
+        tk.Label(parent, text="Press Save to keep changes to models.", bg=self.c["bg"], fg=self.c["muted"],
+                 font=font(8)).pack(anchor="w", pady=(4, 0))
+        self.draw_models()
+
+    def draw_models(self):
+        """One row per model of the working copy, in its order: number, model, voice, (Primary), Edit, Remove."""
+        for child in self.models_card.winfo_children():
+            child.destroy()
+        sets, in_use = self.work["sets"], talkback.active_set(self.work)["name"]
+        holder = self.models_card
+        if len(sets) > self.VISIBLE_MODELS:
+            scroll = Scroll(self.models_card, self.c, height=44 * self.VISIBLE_MODELS + 40)
+            scroll.pack(fill="x")
+            holder = scroll.body
+        grid = table(holder, (("", 0), ("Model", 4), ("Voice", 2), ("", 0)), self.c)
+        for row, voice_set in enumerate(sets, start=1):
+            tk.Label(grid, text=f"Model {row}", bg=self.c["card"], fg=self.c["muted"], font=font(9),
+                     anchor="w").grid(row=row, column=0, sticky="w", padx=(0, 14), pady=9)
+            tk.Label(grid, text=voice_set.get("model") or "—", bg=self.c["card"], fg=self.c["text"],
+                     font=font(10), anchor="w").grid(row=row, column=1, sticky="w", padx=(0, 14))
+            tk.Label(grid, text=talkback.voice_name(voice_set["voice"]), bg=self.c["card"], fg=self.c["text"],
+                     font=font(10), anchor="w").grid(row=row, column=2, sticky="w", padx=(0, 14))
+            if voice_set["name"] == in_use:
+                tk.Label(grid, text="(Primary)", bg=self.c["card"], fg=self.c["accent"],
+                         font=font(9, "bold")).grid(row=row, column=3, sticky="w", padx=(0, 8))
+            actions = tk.Frame(grid, bg=self.c["card"])
+            actions.grid(row=row, column=4, sticky="e", pady=3)
+            button(actions, "Edit", lambda name=voice_set["name"]: self.open_model(name), self.c,
+                   "ghost").pack(side="left")
+            if len(sets) > 1:
+                button(actions, "Remove", lambda name=voice_set["name"]: self.remove_model(name), self.c,
+                       "ghost").pack(side="left")
+        self.refit()
+
+    def open_model(self, name):
+        """Add model (name None) or Edit model, over this dialog; this dialog takes the grab back afterwards."""
+        ModelDialog(self, name).show()
+        try:
+            self.grab_set()
+        except tk.TclError:          # this dialog was closed meanwhile
+            pass
+
+    def remove_model(self, name):
+        self.work = without_model(self.work, name)
+        self.draw_models()
+
     def save(self):
-        name, endpoint, model, voice = self.text("name"), self.text("endpoint"), self.text("model"), self.text("voice")
-        limit, key = self.text("limit"), self.text("key")
+        name, endpoint, key = self.text("name"), self.text("endpoint"), self.text("key")
         if not name:
-            return self.message("Give the provider a name.", bad=True)
+            return self.message("Enter a name for the provider.", bad=True)
         if not endpoint.startswith(("https://", "http://")):
             return self.message("The endpoint must start with https:// or http://.", bad=True)
-        if not model:
-            return self.message("Give the model id this provider answers to.", bad=True)
-        if not voice:
-            return self.message("Give a voice id.", bad=True)
-        if limit and not (limit.isdigit() and int(limit) >= 40):
-            return self.message("Max characters is a whole number, 40 or more, or blank.", bad=True)
-        source_id = self.entry["id"] if self.entry else new_id(name, {e["id"] for e in self.app.settings["sources"]})
-        spec = copy.deepcopy(self.entry) if self.entry else {"id": source_id, "engine": "openai", "set": "Default",
-                                                             "sets": [{"name": "Default", "voices": []}]}
-        spec.update(label=name, base_url=endpoint,
-                    key=spec.get("key") or f"file:secrets/{source_id}.local")
-        voice_set = talkback.active_set(spec)
-        voice_set.update(model=model, voice=voice)
-        voice_set["voices"] = list(dict.fromkeys([voice, *voice_set.get("voices", [])]))
-        if limit:
-            voice_set["request_limit"] = int(limit)
+        if self.entry:
+            spec = copy.deepcopy(self.work)
         else:
-            voice_set.pop("request_limit", None)
+            spec = self._new_spec(name)
+            if spec is None:
+                return
+        spec.update(label=name, base_url=endpoint, key=spec.get("key") or f"file:secrets/{spec['id']}.local")
         clean, problems = talkback.clean_source(spec)
         if clean is None:
             return self.message(problems[0] if problems else "That provider cannot be used.", bad=True)
@@ -887,9 +1107,63 @@ class ProviderDialog(Dialog):
         self.app.save_and_reload()
         self.destroy()
 
+    def _new_spec(self, name):
+        """Add provider: the new source with its first model, or None after saying what is missing."""
+        model, voice, limit = self.text("model"), self.text("voice"), self.text("limit")
+        if not model:
+            return self.message("Enter a model id this provider accepts.", bad=True)
+        if not voice:
+            return self.message("Enter a voice id.", bad=True)
+        if limit and not (limit.isdigit() and int(limit) >= 40):
+            return self.message("Max characters must be blank or a whole number from 40 up.", bad=True)
+        voice_set = {"name": "Default", "model": model, "voice": voice, "voices": [voice]}
+        if limit:
+            voice_set["request_limit"] = int(limit)
+        source_id = new_id(name, {entry["id"] for entry in self.app.settings["sources"]})
+        return {"id": source_id, "engine": "openai", "set": "Default", "sets": [voice_set]}
+
+
+class ModelDialog(Dialog):
+    """Add model or Edit model, opened from Edit provider. It changes that dialog's working copy, not settings."""
+
+    def __init__(self, owner, name=None):
+        voice_set = next((item for item in owner.work["sets"] if item["name"] == name), None)
+        title = "Edit model" if voice_set else "Add model"
+        super().__init__(owner.app, title, 520, None, over=owner)
+        self.owner, self.name, self.entries = owner, name, {}
+        voice_set = voice_set or {}
+        label = owner.work["label"]
+        self.head(title, f"A voice model for {label}, on the same endpoint and key." if voice_set else
+                  f"Another voice model for {label}, on the same endpoint and key.")
+        self.message_line()
+        self.footer([("Cancel", self.destroy, "ghost"), ("Save" if voice_set else "Add model", self.save, "accent")])
+        form = tk.Frame(self, bg=self.c["bg"], padx=22)
+        form.pack(fill="both", expand=True, pady=(0, 6))
+        self._field(form, "model", "Model", voice_set.get("model", ""),
+                    f"The speech model id at {label}, such as fish-audio/s2.1-pro-free:free")
+        self._field(form, "voice", "Voice", voice_set.get("voice", ""), "A voice id this model accepts.")
+        self._field(form, "limit", "Max characters per request", str(voice_set.get("request_limit") or ""),
+                    "Optional. For a model that refuses long text. Groq's limit is 200.")
+        self.bind("<Return>", lambda event: self.save())
+        self.entries["model"].focus_set()
+
+    def save(self):
+        limit = self.text("limit")
+        if limit and not (limit.isdigit() and int(limit) >= 40):
+            return self.message("Max characters must be blank or a whole number from 40 up.", bad=True)
+        if self.name:
+            clean, problem = edited_model(self.owner.work, self.name, self.text("model"), self.text("voice"), limit)
+        else:
+            clean, problem = with_model(self.owner.work, self.text("model"), self.text("voice"), limit)
+        if clean is None:
+            return self.message(problem, bad=True)
+        self.owner.work = clean
+        self.owner.draw_models()
+        self.destroy()
+
 
 class VoiceDialog(Dialog):
-    """The list behind Change: every voice of one source, with Test beside it. A click picks it."""
+    """The list behind Change: the voices of one model as tiles, with Test under each. A click picks it."""
 
     def __init__(self, app, entry, secondary):
         super().__init__(app, "Backup voice" if secondary else "Primary voice", 700, 620)
@@ -898,8 +1172,8 @@ class VoiceDialog(Dialog):
         self.pending = None
         self.mark = "Backup" if secondary else "Primary"
         self.head("Backup voice" if secondary else "Primary voice",
-                  "Microsoft Edge's voices, for when the primary voice fails. No key, no cost." if secondary else
-                  "Select your Primary voice below.")
+                  "Microsoft Edge's voices speak when the primary voice fails. They are free and need no key." if secondary else
+                  "Choose your primary voice below.")
         self.filter_box = None
         if secondary:
             holder = tk.Frame(self, bg=self.c["bg"], padx=22)
@@ -911,8 +1185,18 @@ class VoiceDialog(Dialog):
             tk.Label(holder, text="Type to filter: a name, or a language such as en-GB.", bg=self.c["bg"],
                      fg=self.c["muted"], font=font(8)).pack(anchor="w", pady=(4, 8))
             self.filter_box = box
+        self.tab = talkback.active_set(entry)["name"]      # the list opens on the model in use
+        self.tab_bar = None
+        if not secondary and len(entry["sets"]) > 1:
+            holder = tk.Frame(self, bg=self.c["bg"], padx=22)
+            holder.pack(fill="x", pady=(0, 10))
+            self.tab_bar = tk.Frame(holder, bg=self.c["bg"])
+            self.tab_bar.pack(anchor="w")
+            self.tab_model = tk.Label(holder, text="", bg=self.c["bg"], fg=self.c["muted"], font=font(9))
+            self.tab_model.pack(anchor="w", pady=(2, 0))
         self.footer([("Done", self.destroy, "accent")], note_label=True)
-        self.voice_list = Scroll(self, self.c, height=self.height - (190 if secondary else 150))
+        self.voice_list = Scroll(self, self.c, height=self.height - (190 if secondary else
+                                                                     210 if self.tab_bar else 150))
         self.voice_list.pack(fill="both", expand=True, padx=22)
         self._fill()
         if secondary:
@@ -925,26 +1209,36 @@ class VoiceDialog(Dialog):
         voice_set = talkback.active_set(self.entry)
         return voice_set["name"], voice_set["voice"]
 
-    def _configured(self):
-        """The source's own voices, in the order settings lists them: the one in use is marked, never moved."""
-        rows, seen = [], set()
-        for voice_set in self.entry["sets"]:
-            for voice in voice_set.get("voices", []):
-                if voice in seen:
-                    continue
-                seen.add(voice)
-                rows.append({"set": voice_set["name"], "voice": voice, "note": voice_set["name"]})
-            if voice_set["voice"] not in seen:
-                seen.add(voice_set["voice"])
-                rows.append({"set": voice_set["name"], "voice": voice_set["voice"], "note": voice_set["name"]})
-        return rows
-
     def set_name(self):
         return talkback.active_set(self.entry)["name"]
 
     def _fill(self):
-        self.rows = self._configured()
+        self.rows = voice_rows(self.entry, self.tab)   # in settings' order: the voice in use is marked, never moved
         self.render()
+
+    def show_tab(self, set_name):
+        self.tab = set_name
+        self._fill()
+
+    def _tabs(self):
+        """Model 1, Model 2 ...: the shown one in bold and underlined, the one in use followed by '(Primary)'."""
+        for child in self.tab_bar.winfo_children():
+            child.destroy()
+        for tab in model_tabs(self.entry):
+            shown = tab["set"] == self.tab
+            pick = (lambda event=None, name=tab["set"]: self.show_tab(name))
+            item = tk.Frame(self.tab_bar, bg=self.c["bg"])
+            item.pack(side="left", padx=(0, 22))
+            label = button(item, tab["label"], pick, self.c, "ghost" if shown else "quiet", background=self.c["bg"])
+            label.configure(font=font(10, "bold underline" if shown else "normal"), padx=0, pady=2)
+            label.pack(side="left")
+            if tab["in_use"]:
+                mark = tk.Label(item, text="(Primary)", bg=self.c["bg"], fg=self.c["accent"], font=font(8, "bold"),
+                                cursor="hand2")
+                mark.pack(side="left", padx=(5, 0))
+                mark.bind("<Button-1>", pick)
+            if shown:
+                self.tab_model.configure(text=tab["model"])
 
     def _poll_edge(self):
         try:
@@ -954,7 +1248,7 @@ class VoiceDialog(Dialog):
         if voices:
             self._add_edge(voices)
         else:
-            self.message("Microsoft's voice list could not be fetched; showing the voices in settings.", bad=True)
+            self.message("Could not get Microsoft's voice list. Showing the voices in your settings.", bad=True)
 
     def _add_edge(self, voices):
         """Every English Edge voice, alphabetically, with a configured one merged in where it sorts.
@@ -983,46 +1277,68 @@ class VoiceDialog(Dialog):
         self.pending = None
         query = (self.query.get().strip().lower() if self.filter_box else "")
         rows = [row for row in self.rows if query in (row["voice"] + " " + row["note"]).lower()]
+        if self.tab_bar:
+            self._tabs()
         self.voice_list.clear()
         if not rows:
             tk.Label(self.voice_list.body, text="No voice matches that.", bg=self.c["card"],
-                     fg=self.c["muted"], font=font(9), padx=14, pady=16).pack(anchor="w")
+                     fg=self.c["muted"], font=font(9), padx=14, pady=16).grid(row=0, column=0, sticky="w")
             return
-        for row in rows[:MAX_LISTED]:
-            self._row(row)
+        for column in range(TILES_ACROSS):
+            self.voice_list.body.grid_columnconfigure(column, weight=1, uniform="tile")
+        for place, row in enumerate(rows[:MAX_LISTED]):
+            self._tile(row, place)
         if len(rows) > MAX_LISTED:
-            tk.Label(self.voice_list.body, text=f"{len(rows) - MAX_LISTED} more: type in the filter to narrow it.",
-                     bg=self.c["card"], fg=self.c["muted"], font=font(8), padx=14, pady=10).pack(anchor="w")
+            tk.Label(self.voice_list.body, text=f"{len(rows) - MAX_LISTED} more. Type in the filter to narrow the list.",
+                     bg=self.c["card"], fg=self.c["muted"], font=font(8), pady=10).grid(
+                         row=MAX_LISTED // TILES_ACROSS + 1, column=0, columnspan=TILES_ACROSS, sticky="w")
         self.message(f"{len(rows)} voices.")
 
-    def _row(self, row):
-        """One voice: a box that picks it, and Test on its right that only tests.
+    def _tile(self, row, place):
+        """One voice as a tile, three to a line: one outlined box in two parts, the voice above and Test below.
 
-        The box is the click target, so nobody selects a voice by accident while reaching for Test. The voice in use
-        says `(Primary)` in the accent colour and sits on the accent's soft tint.
+        The upper part picks the voice; the strip under the dividing line only tests it. Both are inside one outline,
+        so a Test plainly belongs to its voice, and each part lights up on its own under the pointer, so it is clear
+        which of the two a click will do. The voice in use has the accent outline, the soft tint and a tick.
         """
         chosen = (row["set"], row["voice"]) == self.current
-        background = self.c["card"]
-        frame = tk.Frame(self.voice_list.body, bg=background)
-        frame.pack(fill="x", pady=(0, 6))
-        frame.grid_columnconfigure(0, weight=1)
+        cell = tk.Frame(self.voice_list.body, bg=self.c["card"])
+        line, column = divmod(place, TILES_ACROSS)
+        cell.grid(row=line, column=column, sticky="nsew", padx=(10 if column == 0 else 0, 10),
+                  pady=(10 if line == 0 else 0, 10))
+        edge = self.c["accent"] if chosen else self.c["line"]
         resting = self.c["accent_soft"] if chosen else self.c["card"]
-        box = tk.Frame(frame, bg=resting, padx=14, pady=10)
-        box.grid(row=0, column=0, sticky="ew")
-        name = tk.Label(box, text=f"{talkback.voice_name(row['voice'])} ({self.mark})" if chosen else
-                        talkback.voice_name(row["voice"]), bg=box["bg"],
+        box = tk.Frame(cell, bg=edge, highlightthickness=1, highlightbackground=edge)
+        box.pack(fill="x")
+        pick = tk.Frame(box, bg=resting, padx=12, pady=9)
+        pick.pack(fill="x")
+        top = tk.Frame(pick, bg=resting)
+        top.pack(fill="x")
+        name = tk.Label(top, text=talkback.voice_name(row["voice"]), bg=resting,
                         fg=self.c["accent"] if chosen else self.c["text"], font=font(10, "bold"), anchor="w")
-        note = tk.Label(box, text=row["note"], bg=box["bg"], fg=self.c["muted"], font=font(8), anchor="w")
-        name.pack(anchor="w")
-        note.pack(anchor="w")
-        test = button(frame, "Test", lambda row=row: self.test(row), self.c, "quiet", background=background)
-        test.grid(row=0, column=1, padx=(10, 0), sticky="e")
-        def tint(on):                 # a tint under the pointer is the only hover: a chosen row keeps its own colour
+        name.pack(side="left")
+        parts = [pick, top, name]
+        if chosen:
+            tick = tk.Label(top, text="\u2713", bg=resting, fg=self.c["accent"], font=font(10, "bold"))
+            tick.pack(side="right")
+            parts.append(tick)
+        if row["note"] != row["set"]:          # a model's own name is already on its tab; a language is worth a line
+            note = tk.Label(pick, text=row["note"], bg=resting, fg=self.c["muted"], font=font(8), anchor="w")
+            note.pack(anchor="w")
+            parts.append(note)
+        test = tk.Label(box, text="\u25B6  Test", bg=self.c["card"], fg=self.c["muted"], font=font(8), anchor="w",
+                        padx=12, pady=5, cursor="hand2")
+        test.pack(fill="x", pady=(1, 0))       # the gap shows the box's own colour: the line between the two parts
+        test.bind("<Button-1>", lambda event, row=row: self.test(row))
+        test.bind("<Enter>", lambda event: test.configure(bg=self.c["hover"], fg=self.c["text"]))
+        test.bind("<Leave>", lambda event: test.configure(bg=self.c["card"], fg=self.c["muted"]))
+
+        def tint(on):                 # a tint under the pointer is the only hover: the chosen tile keeps its own colour
             colour = resting if chosen or not on else self.c["hover"]
-            for widget in (box, name, note):
+            for widget in parts:
                 widget.configure(bg=colour)
 
-        for widget in (box, name, note):
+        for widget in parts:
             widget.configure(cursor="hand2")
             widget.bind("<Button-1>", lambda event, row=row: self.choose(row))
             widget.bind("<Enter>", lambda event: tint(True))
@@ -1042,11 +1358,111 @@ class VoiceDialog(Dialog):
         if not talkback.can_speak(self.entry):
             return self.message("Add a key for this provider first.", bad=True)
         if speaking(self.app.settings["port"]) is False:
-            return self.message("Speaking is off: left-click the tray icon to switch it on.", bad=True)
+            return self.message("Speaking is off. Click the tray icon to switch it on.", bad=True)
         if not send.deliver(test_words(row["voice"]), "console", self.app.settings["port"],
                             only=self.entry["id"], set_name=row["set"], voice=row["voice"]):
-            return self.message("Agent Talkback is not running: start it with pythonw talkback.py.", bad=True)
+            return self.message("Agent Talkback is not running. Start it with pythonw talkback.py.", bad=True)
         self.message(f"Testing in {talkback.voice_name(row['voice'])}.")
+
+
+class TalkersDialog(Dialog):
+    """One row per folder heard: a switch for a custom voice, and the tray's voice menu to choose it.
+
+    A change redraws only its own row, so no row jumps.
+    """
+
+    def __init__(self, app):
+        super().__init__(app, "Voices by Agent", 700, 620)
+        self.head("Voices by Agent", "Your agents' folders are listed after their first spoken replies. Toggle to turn "
+                                     "on custom voice for the folders.")
+        self.footer([("Done", self.destroy, "ghost")], note_label=True)
+        holder = card(self, self.c)
+        holder.pack(fill="both", expand=True, padx=22)
+        self.rows = Scroll(holder, self.c, height=self.height - 190)
+        self.rows.pack(fill="both", expand=True)
+        self.rows.body.grid_columnconfigure(0, weight=1)
+        self.bind("<MouseWheel>", self.rows.scroll)  # the wheel works over a row's own widgets too
+        self.lines = {}                              # talker id: its widgets
+        self.render()
+
+    def render(self):
+        self.rows.clear()
+        self.lines = {}
+        rows = talker_rows(self.app.settings)
+        if not rows:
+            tk.Label(self.rows.body, text="No agent folders yet.", bg=self.c["card"], fg=self.c["muted"],
+                     font=font(9), padx=18, pady=16).grid(row=0, column=0, sticky="w")
+        for number, row in enumerate(rows):
+            self.lines[row["id"]] = self._line(number, row)
+            self._show(row)
+
+    def _line(self, number, row):
+        talker_id = row["id"]
+        holder = tk.Frame(self.rows.body, bg=self.c["card"])
+        holder.grid(row=number, column=0, sticky="ew")
+        if number:                                   # inset on the left by what the scroll thumb takes on the right
+            divider(holder, self.c).pack_configure(padx=(Scroll.THUMB + 10, 0))
+        line = tk.Frame(holder, bg=self.c["card"], padx=18, pady=14)
+        line.pack(fill="x")
+        words = tk.Frame(line, bg=self.c["card"])
+        switch = Switch(line, self.c, row["on"], lambda on: self.toggle(talker_id, on))
+        switch.pack(side="right")
+        selector = tk.Menubutton(line, bg=self.c["card"], fg=self.c["text"], activebackground=self.c["hover"],
+                                 activeforeground=self.c["text"], disabledforeground=self.c["muted"],
+                                 font=font(10), relief="flat", bd=0, highlightthickness=1,
+                                 highlightbackground=self.c["line"], width=30, anchor="w", padx=10, pady=5)
+        selector.pack(side="right", padx=(0, 16))
+        words.pack(side="left")
+        tk.Label(words, text=row["folder"], bg=self.c["card"], fg=self.c["text"], font=font(11, "bold"),
+                 justify="left", wraplength=270).pack(anchor="w")
+        warning = tk.Label(words, text="", bg=self.c["card"], fg=self.c["warn"], font=font(9), justify="left",
+                           wraplength=270)
+        chosen = tk.StringVar()
+        selector.configure(menu=self._voice_cascade(selector, talker_id, chosen))
+        return {"switch": switch, "selector": selector, "chosen": chosen, "warning": warning}
+
+    def _voice_cascade(self, selector, talker_id, chosen):
+        """Provider > model > voice, from the same `voice_menu()` the tray's menu is built from."""
+        look = {"tearoff": 0, "font": font(10), "bg": self.c["card"], "fg": self.c["text"],
+                "activebackground": self.c["hover"], "activeforeground": self.c["text"], "selectcolor": self.c["text"]}
+        menu = tk.Menu(selector, **look)
+        for provider in talkback.voice_menu(self.app.settings):
+            models = tk.Menu(menu, **look)
+            for voice_set in provider["sets"]:
+                voices = tk.Menu(models, **look)
+                for voice in voice_set["voices"]:
+                    choice = {"source": provider["id"], "set": voice_set["name"], "voice": voice}
+                    voices.add_radiobutton(label=talkback.voice_name(voice), variable=chosen,
+                                           value=json.dumps(choice, sort_keys=True),
+                                           command=lambda choice=choice: self.change(talker_id, choice))
+                models.add_cascade(label=voice_set["name"], menu=voices)
+            menu.add_cascade(label=provider["label"], menu=models)
+        return menu
+
+    def _show(self, row):
+        """Bring one row up to date: switched off, the selector is greyed and shows the automatic voice."""
+        line = self.lines[row["id"]]
+        line["switch"].set(row["on"])
+        line["chosen"].set(json.dumps(row["choice"], sort_keys=True))
+        line["selector"].configure(text=row["label"] + "  \u25be", state="normal" if row["on"] else "disabled",
+                                   cursor="hand2" if row["on"] else "arrow")
+        if row["lacking"]:
+            line["warning"].configure(text=f"{row['lacking']} is no longer available. Using the automatic voice.")
+            line["warning"].pack(anchor="w", pady=(2, 0))
+        else:
+            line["warning"].pack_forget()
+
+    def toggle(self, talker_id, on):
+        """On starts from the voice the folder has been speaking in; off hands it back to the automatic one."""
+        self.change(talker_id, automatic_choice(self.app.settings, talker_id) if on else None)
+
+    def change(self, talker_id, choice):
+        if not self.app.settings.set_talker(talker_id, voice=choice):
+            self.render()
+            return self.message("That folder is no longer listed.", bad=True)
+        self.app.save_and_reload()
+        self._show(next(row for row in talker_rows(self.app.settings) if row["id"] == talker_id))
+        self.message("Saved.")
 
 
 def main():

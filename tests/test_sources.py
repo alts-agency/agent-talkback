@@ -511,6 +511,37 @@ class SpeechRequests(SettingsFile):
         self.assertEqual(urlopen.call_count, 1)
 
 
+class Cartesia(unittest.TestCase):
+    ENTRY = {"engine": "cartesia", "base_url": "https://api.cartesia.ai/tts/sse", "model": "sonic-3.6",
+             "voice": "Daniel"}
+    ID = "33333333-3333-4333-8333-333333333333"
+
+    def test_the_engine_is_a_source_like_any_keyed_one(self):
+        entry, problems = talkback.clean_source({
+            "id": "cartesia", "engine": "cartesia", "base_url": "https://api.cartesia.ai", "key": "file:k.local",
+            "sets": [{"name": "Default", "voice": "Daniel", "model": "sonic-3.6"}]})
+        self.assertEqual((entry["engine"], problems), ("cartesia", []))
+
+    def test_the_request_goes_to_tts_bytes_whatever_path_the_address_has(self):
+        with mock.patch.object(talkback, "cartesia_voice_id", return_value=self.ID):
+            url, payload = talkback._cartesia_request(self.ENTRY, "Hello there.", "k")
+        self.assertEqual(url, "https://api.cartesia.ai/tts/bytes")
+        self.assertEqual((payload["model_id"], payload["transcript"], payload["voice"]),
+                         ("sonic-3.6", "Hello there.", {"id": self.ID}))
+        self.assertEqual(payload["output_format"]["container"], "wav")
+
+    def test_a_voice_id_passes_through_and_a_name_is_looked_up_once(self):
+        self.assertEqual(talkback.cartesia_voice_id(dict(self.ENTRY, voice=self.ID), "k"), self.ID)
+        body = json.dumps({"data": [{"id": "other", "name": "Daniela"}, {"id": self.ID, "name": "Daniel"}]}).encode()
+        talkback._CARTESIA_VOICES.clear()
+        with mock.patch("urllib.request.urlopen") as opened:
+            opened.return_value.__enter__.return_value.read.return_value = body
+            first = talkback.cartesia_voice_id(self.ENTRY, "k")
+            second = talkback.cartesia_voice_id(self.ENTRY, "k")
+        self.assertEqual((first, second, opened.call_count), (self.ID, self.ID, 1))
+        talkback._CARTESIA_VOICES.clear()
+
+
 class Prices(unittest.TestCase):
     def test_a_price_is_said_after_its_number(self):
         self.assertEqual(talkback._strip_for_speech("It costs \u20ac5 today."), "It costs 5 euros today.")

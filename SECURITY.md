@@ -1,18 +1,24 @@
 # Security
 
 Talkback listens on your own machine, speaks text that other programs hand it, and sends that text to a
-text-to-speech provider. That is the whole attack surface.
+text-to-speech provider.
 
 ## Supported versions
 The latest release on `main`. Windows 10 and 11; other platforms are not supported.
 
 ## Trust model
 - The HTTP server binds `127.0.0.1` only and refuses any other bind address.
-- Any program already running as you can ask Talkback to speak. That is accepted: such a program could just make
-  the sound itself. The line that matters is the **browser**, which is why a request must look like it came from a
-  local client, not from a page.
-- Reply text leaves the machine to whichever provider is selected: OpenRouter (HeyGen voices), Groq, or Microsoft
-  (edge-tts). Your key is the one you configured; nothing is sent anywhere else.
+- Any program already running as you can ask Talkback to speak. We accept that, because such a program could make
+  sound itself. A web page in your **browser** must not be able to, so a request has to look like it came from a
+  program on your machine.
+- The words being spoken go to your primary provider. That is OpenRouter unless you change it to Groq, Cartesia, an
+  endpoint you added or Microsoft (edge-tts). If it fails, they go to the next provider in the order. For a folder with
+  a custom voice, they go to that voice's provider first. Each key goes only to its own provider.
+- `send.py` writes one file, `.talkback.json` (a random id and the folder's name), in the folder an agent runs in.
+  `settings.json` keeps each agent's name and the last two parts of its folder path; `GET /status` does not return them.
+- The setup window gets Microsoft's voice list from Microsoft when you open the backup voice.
+- `send.py` reads Claude Code's job files in `%USERPROFILE%\.claude\jobs` and looks for a marker file in
+  `%USERPROFILE%\.cchelper`, so that helper sessions are not spoken.
 - Keys stay in your own files or environment. They are never in this repository, the log, the settings that
   `GET /status` returns, or an error message.
 
@@ -30,8 +36,8 @@ These are verified before every release:
 7. No shell command is built by pasting a path into a string; the auto-start call passes an encoded command.
 8. Runtime dependencies are pinned, and `pip-audit` runs in CI.
 
-Each guarantee above has a test in `tests/test_setup.py` (class `Hardening`), so a change that weakens one fails the
-suite.
+Tests cover guarantees 1, 2, 4, 5 and 6 (class `Hardening` in `tests/test_setup.py`) and the encoded auto-start call in
+7 (class `StartedWith` in `tests/test_send.py`). CI checks guarantee 8. Guarantee 3 has no test.
 
 ## Reporting a vulnerability
 Open a private security advisory on the GitHub repository (Security → Report a vulnerability). Do not open a public

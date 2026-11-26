@@ -1,6 +1,34 @@
 # Changelog
 What a user of Talkback would notice. Format follows Keep a Changelog; versions follow semver.
 
+## [0.4.0] - 2026-11-27
+
+### Added
+- Each agent folder can have its own voice. The first time `send.py` sends from a folder, it writes
+  `.talkback.json` there (a random id and the folder's name). **Voices by Agent** in the setup window lists the
+  folders you have heard. With a folder's switch off, it gets an automatic voice picked from your primary provider's
+  voices. Switch it on to choose the provider, model and voice yourself. Plain HTTP replies can send a `talker` to do
+  the same. If you keep your projects in git, you can commit the file or add it to `.gitignore`.
+- A provider can hold several voice models. **Edit** on a provider now lists its **Models**, with **+ Add model**, and
+  **Edit** and **Remove** on each one, all on the same endpoint and key. For example, you can have Fish Audio beside
+  HeyGen on OpenRouter. The provider table shows `+1` for each extra model, and **Change** has a tab for each.
+- A `cartesia` engine for Cartesia's own speech endpoint. You add it in `settings.json`.
+
+### Changed
+- **Change** shows voices as tiles, three to a line, each with its own **Test** strip. Click a tile to use that voice;
+  the one in use is tinted and ticked.
+- `send.py` starts Talkback with the Python that Talkback last ran on, so after the first start your hook can use any
+  Python.
+- Claude Code background sessions (`claude --bg`) are never spoken. Neither are helper sessions in a terminal that are
+  marked with a file in `%USERPROFILE%\.cchelper`.
+- The setup window, its dialogs and messages are reworded in plainer English. The test line now says "Testing
+  Talkback in Guy's voice."
+- `settings.json` now keeps `talkers` (your agent folders) and `pythonw`. `GET /status` leaves both out.
+
+### Fixed
+- The free Microsoft voice sometimes returned no audio, so a reply went unspoken or moved on to the next provider.
+  Talkback now tries it a second time.
+
 ## [0.3.0] - 2026-11-13
 
 ### Added
@@ -127,9 +155,6 @@ The first public release.
 
 ### Security
 - `Pillow` is pinned to 13.0.0. 12.3.0 had 40 known advisories (`pip-audit`).
-
-### Planned
-- A desktop shortcut to the setup console.
 
 ## [0.1.0] - 2026-11-05 (not published)
 ### Added
